@@ -60,6 +60,8 @@ async def _client(make_call, idx, args, out):
         await rounds()
     else:
         await asyncio.gather(*(loop() for _ in range(args.concurrency)))
+    if close := getattr(call, "close", None):
+        await close()
     out.put((done, overheads, dict(errors)))
 
 
@@ -68,7 +70,7 @@ def _proc(make_call, idx, args, out):
 
 
 def _pct(xs, p):
-    return statistics.quantiles(xs, n=100)[p - 1] if len(xs) >= 2 else float("nan")
+    return statistics.quantiles(xs, n=100, method="inclusive")[p - 1] if len(xs) >= 2 else float("nan")
 
 
 def run(make_call, name: str, lockstep: bool = False):

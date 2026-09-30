@@ -1,107 +1,123 @@
-# Function input limits: four ways past them
+# Scaling a Modal Function to more inputs
 
-Many callers making many short `.remote()` calls to one Modal Function can hit two
-platform limits:
+A Function called with `.remote()` accepts 200 inputs/s and queues at most 2,000
+([limits](https://modal.com/docs/guide/function-invocation-methods#scalability)).
+Past that, callers see `Input rate limit exceeded` or `reached pending input queue limit`.
 
-- `Input rate limit (200/s) exceeded for function fu-...`
-- `Function fu-... reached pending input queue limit (2000)`
+Each folder shows one way past the limits: an `app.py` to deploy and a `caller.py` that
+makes 1,000 concurrent calls. The work is a 1-10 s sleep.
 
-This repo shows four ways to get past them, each as a small deployable app plus the
-simplest caller that uses it. The example workload is 8 clients, each making 1,000
-concurrent calls that take 1-10 s. That is about 800-8,000 calls/s, depending on the
-call duration.
+## 1. `spawn` instead of `remote`: [`spawn/`](spawn/)
 
-## The limits
+Async calls are accepted at up to 1,500 inputs/s, with a queue of 1 million. The
+Function stays the same. Only the caller changes:
 
-From the [Function invocation methods guide](https://modal.com/docs/guide/function-invocation-methods#scalability):
+```python
+# before
+result = await worker.work.remote.aio(x)
 
-| | Synchronous (`.remote`, `.map`) | Asynchronous (`.spawn`, `.spawn_map`) |
-|---|---|---|
-| Rate | 200/s | 1,500/s |
-| Inputs waiting for a container | 2,000 | 1 million |
-| Inputs in the system (queued or running) | 25,000 | not stated |
+# after
+call = await worker.work.spawn.aio(x)
+result = await call.get.aio()
+```
 
-Limits apply per Function. Each input counts once: a `.map()` item is an input, and so
-is each call to a Function decorated with
-[`@modal.batched`](https://modal.com/docs/guide/dynamic-batching). Neither of those
-reduces the count.
+Acceptance is not throughput. Above about 200 inputs/s per Function, spawned inputs
+still get accepted, but they wait longer to start (see [Measured](#measured)). Spawned
+calls also keep running if the caller exits. Call `call.cancel()` for results you no
+longer need.
 
-## The approaches
+## 2. One app copy per caller: [`copies/`](copies/)
 
-| | [App copies](copies/) | [`spawn` + `get`](spawn/) | [Caller-side batching](batching/) | [`app.server()`](server/) |
+Limits apply per Function, so N deployed copies give N times the limits. No code change:
+
+```bash
+for i in 0 1 2 3 4 5 6 7; do modal deploy --name demo-copy-$i copies/app.py; done
+```
+
+```python
+worker = modal.Cls.from_name(f"demo-copy-{i}", "Worker")()
+```
+
+## 3. Many items per input: [`batching/`](batching/)
+
+When the caller already has a list of work, send it in chunks. One input then carries
+32 items:
+
+```python
+@modal.method()
+async def work_many(self, xs: list[float]) -> list[float]: ...
+```
+
+```python
+chunks = [xs[i : i + 32] for i in range(0, len(xs), 32)]
+results = await asyncio.gather(*(worker.work_many.remote.aio(c) for c in chunks))
+```
+
+Each chunk finishes when its slowest item does. If one item fails, the whole chunk fails.
+
+## 4. An HTTP server: [`server/`](server/)
+
+`@app.server()` requests go through Modal's HTTP proxy, not the input queue, so there is
+no input limit. The Function becomes a web app:
+
+```python
+@app.server(port=8000, cpu=1, target_concurrency=1000)
+class WorkerServer:
+    @modal.enter()
+    def start(self):
+        threading.Thread(target=lambda: uvicorn.run(api, host="0.0.0.0", port=8000), daemon=True).start()
+```
+
+```python
+async with session.post("/work", json={"seconds": x}) as r:  # aiohttp
+    result = (await r.json())["seconds"]
+```
+
+The client handles serialization, retries (503 when no container is ready) and timeouts.
+Use aiohttp for high concurrency. With httpx, one process with 1,000 requests in flight
+got about a third of the throughput.
+Production callers also send a [Proxy Token](https://modal.com/docs/guide/webhook-proxy-auth).
+
+## Which one
+
+| | Function changes | Caller changes | Limit |
+|---|---|---|---|
+| `spawn` | No | One line | 1,500/s accepted, starts slow down above about 200/s |
+| App copies | No | Look up copy N | 200/s × N copies |
+| Batching | Takes a list | Send chunks | 200/s × chunk size |
+| Server | Becomes a web app | HTTP client | No input limit |
+
+Start with `spawn`: it is a one-line change. If its start delay matters, deploy app
+copies. Batching fits when the caller already has a list. A Server fits when latency
+matters and the client can own retries. In every case, throughput is also capped by compute: at most
+`max_containers × inputs per container ÷ call duration` calls per second.
+
+## Measured
+
+`loadtest/run.py` with 8 clients × 1,000 concurrent 1-10 s calls, 100 s measured:
+
+| | Calls/s | Ideal | Added latency p50 / p90 | Errors |
 |---|---|---|---|---|
-| **Callee change** | None. Deploy N times with `--name` | None | Method takes and returns a list and runs the items in parallel | Rewrite as an HTTP app (for example FastAPI + uvicorn) in `@app.server` |
-| **Caller change** | Each client looks up its own copy | `.spawn.aio()` then `.get.aio()` | Send lists in chunks, flatten the results | HTTP client, URL lookup, Proxy Token, 503 retry |
-| **Request shape** | One input per call | One input per call | One input per chunk | One HTTP request per call |
-| **Arguments** | Any Python object (cloudpickle) | Any Python object | Any Python object, as a list | JSON or bytes you serialize yourself |
-| **Rate limit** | 200/s per copy | 1,500/s | 200/s inputs, times the chunk size in tasks | None |
-| **Queue limit** | 2,000 per copy | 1 million | 2,000 inputs, times the chunk size in tasks | None: 503 when no container is ready |
-| **Latency** | Normal `.remote` | Higher: the asynchronous path is durable | Each item waits for the slowest in its chunk | Lowest |
-| **CPU cost** | Unchanged | Unchanged | Higher for CPU-bound work: finished cores idle until the chunk's slowest item ends | Unchanged, if the handler moves CPU work off the event loop |
-| **Failures and retries** | Per call, with the Function's `retries` | Per call, with `retries` | One failing item fails the chunk, and `retries` reruns all of it | No Modal retries or timeouts. The client handles both |
-| **If the caller dies** | Call cancelled within about 2 min | Call keeps running and its result is kept for 7 days. Cancel with `fc.cancel()` | Cancelled | Request dropped |
-| **Operations** | N deploys, N autoscalers, N warm pools | One deploy | One deploy | One deploy, autoscaled on `target_concurrency`, plus token management |
-| **Modal features kept** | All | All | All, but per chunk | No input queue, retries, per-call timeouts or per-call records in the dashboard |
+| `spawn` | 673 | 1,455 | 0.26 / 23 s | 0 |
+| App copies (8) | 1,360 | 1,455 | 0.33 / 0.63 s | 0 |
+| Batching (chunks of 32, one round of 1,000 at a time) | 740 | about 800 | 0.60 / 1.11 s | 0 |
+| Server (aiohttp client) | 1,419 | 1,455 | 0.14 / 0.17 s | 0 |
 
-**Where to start.** `spawn` is the smallest change: one line in the caller and nothing
-in the Function. App copies also need no code change and work straight away. A Server
-is the long-term fit when latency matters, but it is a rewrite, and the client takes
-over retries and timeouts. Batching changes both sides and fits best when the caller
-already has a list of work to submit together.
+Each client waits for its calls, so `spawn`'s start delay also lowers its calls/s.
+Batching's ideal is lower because each round waits for its slowest call.
 
-**Compute is a separate ceiling.** None of these changes the CPU a call needs.
-Completed calls per second are at most `max_containers × concurrent inputs per
-container ÷ mean call duration`. Check that number before raising a rate limit. For
-example, 100 containers × 10 concurrent inputs ÷ 5 s is 200 calls/s.
-
-## Run the examples
-
-Requires Python 3.11+ and a Modal account.
+## Run
 
 ```bash
 pip install -r requirements.txt
-
-# deploy
-for i in 0 1 2 3 4 5 6 7; do modal deploy --name demo-copy-$i copies/app.py; done
 modal deploy spawn/app.py
-modal deploy batching/app.py
-modal deploy server/app.py
-
-# one client's worth of calls (1,000), with timing
-CLIENT_IDX=0 python copies/caller.py
-python spawn/caller.py
-python batching/caller.py
-python server/caller.py
+python spawn/caller.py        # prints "1000 calls in N s"
 ```
 
-The Function in every app sleeps 1-10 s in place of real work. Swap in your own
-function body to test your workload.
+[`loadtest/`](loadtest/) runs sustained load: `python loadtest/run.py spawn --clients 8 --concurrency 1000`.
 
-## Load test
-
-[`loadtest/`](loadtest/) runs sustained load: N clients as separate processes, M
-concurrent calls each. It reports completed calls/s, overhead (latency minus the
-call's own duration) and errors grouped by message.
-
-```bash
-python loadtest/run.py fake     --clients 8 --concurrency 1000   # no Modal; checks the harness
-python loadtest/run.py copies   --clients 8 --concurrency 1000
-python loadtest/run.py spawn    --clients 8 --concurrency 1000
-python loadtest/run.py server   --clients 8 --concurrency 1000
-python loadtest/run.py batching --clients 8 --concurrency 1000   # lockstep rounds, chunks of 32
-```
-
-The demo Functions sleep instead of using CPU. The load test therefore measures Modal's
-input and routing limits, not compute capacity.
-
-## Clean up
-
-The apps keep warm containers (`min_containers`) until stopped:
+Stop the apps when done. They keep a warm container:
 
 ```bash
 for app in demo-copy-{0..7} demo-spawn demo-batch demo-server; do modal app stop --yes $app; done
 ```
-
-The Server example sets `unauthenticated=True` to keep the test simple. Production
-callers should send a [Proxy Token](https://modal.com/docs/guide/webhook-proxy-auth)
-instead.

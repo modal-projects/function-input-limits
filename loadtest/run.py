@@ -32,21 +32,24 @@ async def spawn(idx: int):
 
 
 async def server(idx: int):
-    import httpx
+    import aiohttp
     import modal
 
     url = await modal.Server.from_name("demo-server", "WorkerServer").get_url.aio()
-    client = httpx.AsyncClient(base_url=url, timeout=60, limits=httpx.Limits(max_connections=2000))
+    session = aiohttp.ClientSession(
+        base_url=url, connector=aiohttp.TCPConnector(limit=2000), timeout=aiohttp.ClientTimeout(total=60)
+    )
 
     async def call(seconds: float) -> float:
         for attempt in range(5):
-            r = await client.post("/work", json={"seconds": seconds})
-            if r.status_code != 503:
-                r.raise_for_status()
-                return r.json()["seconds"]
+            async with session.post("/work", json={"seconds": seconds}) as r:
+                if r.status != 503:
+                    r.raise_for_status()
+                    return (await r.json())["seconds"]
             await asyncio.sleep(0.2 * 2**attempt)
         raise RuntimeError("503 after 5 attempts")
 
+    call.close = session.close
     return call
 
 

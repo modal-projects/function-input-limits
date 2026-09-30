@@ -5,7 +5,7 @@ import threading
 
 import modal
 
-image = modal.Image.debian_slim().uv_pip_install("fastapi", "uvicorn")
+image = modal.Image.debian_slim().uv_pip_install("fastapi[standard]")  # includes uvicorn
 app = modal.App("demo-server", image=image)
 
 with image.imports():
@@ -20,7 +20,7 @@ with image.imports():
 
 
 # unauthenticated for the example only; production callers send a Proxy Token.
-@app.server(port=8000, target_concurrency=1000, min_containers=2, max_containers=16, unauthenticated=True)
+@app.server(port=8000, cpu=1, target_concurrency=1000, min_containers=2, max_containers=16, unauthenticated=True)
 class WorkerServer:
     @modal.enter()
     def start(self):
