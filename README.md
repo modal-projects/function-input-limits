@@ -16,60 +16,93 @@ Three terms used below:
   (`@modal.concurrent(max_inputs=N)`). Modal adds containers as calls pile up, up to
   `max_containers`.
 
-## 1. `spawn` instead of `remote`: [`spawn/`](spawn/)
+## Starting point
 
-Async calls are accepted at up to 1,500 inputs/s, with a queue of 1 million. The
-Function stays the same. Only the caller changes:
+A Function that runs several calls per container, called once per item:
 
 ```python
-# before
-result = await worker.work.remote.aio(x)
+# app.py
+@app.cls()
+@modal.concurrent(max_inputs=500)
+class Worker:
+    @modal.method()
+    async def work(self, x: float) -> float: ...
+```
 
-# after
-call = await worker.work.spawn.aio(x)
-result = await call.get.aio()
+```python
+# caller.py
+worker = modal.Cls.from_name("my-app", "Worker")()
+results = await asyncio.gather(*(worker.work.remote.aio(x) for x in xs))
+```
+
+Each approach below changes one side of this.
+
+## 1. `spawn` instead of `remote`: [`spawn/`](spawn/)
+
+The Function stays the same. The caller spawns each call, then waits for its result:
+
+```python
+# caller.py
+async def call(x):
+    fc = await worker.work.spawn.aio(x)
+    return await fc.get.aio()
+
+results = await asyncio.gather(*(call(x) for x in xs))
 ```
 
 Spawned inputs are accepted at up to 1,500/s, but they start more slowly: above about
 200/s per Function, extra inputs wait instead of failing (see [Measured](#measured)).
-Spawned calls also keep running if the caller exits. Call `call.cancel()` for results you
+Spawned calls also keep running if the caller exits. Call `fc.cancel()` for results you
 no longer need.
 
 ## 2. One app copy per caller: [`copies/`](copies/)
 
-Limits apply per Function, so N deployed copies give N times the limits. No code change:
+Limits apply per Function, so N deployed copies give N times the limits. The code stays
+the same. Deploy it N times under different names:
 
 ```bash
 for i in 0 1 2 3 4 5 6 7; do modal deploy --name demo-copy-$i copies/app.py; done
 ```
 
 ```python
+# caller.py, for caller number i
 worker = modal.Cls.from_name(f"demo-copy-{i}", "Worker")()
+results = await asyncio.gather(*(worker.work.remote.aio(x) for x in xs))
 ```
 
 ## 3. Many items per input: [`batching/`](batching/)
 
-When the caller already has a list of work, send it in chunks. One input then carries
-32 items:
+The Function takes a list and runs its items concurrently. The caller sends chunks, so
+1,000 items become 32 inputs:
 
 ```python
+# app.py
 @modal.method()
-async def work_many(self, xs: list[float]) -> list[float]: ...
+async def work_many(self, xs: list[float]) -> list[float]:
+    return list(await asyncio.gather(*(do_work(x) for x in xs)))
 ```
 
 ```python
+# caller.py
 chunks = [xs[i : i + 32] for i in range(0, len(xs), 32)]
 results = await asyncio.gather(*(worker.work_many.remote.aio(c) for c in chunks))
+results = [r for chunk in results for r in chunk]
 ```
 
 Each chunk finishes when its slowest item does. If one item fails, the whole chunk fails.
 
 ## 4. An HTTP server: [`server/`](server/)
 
-`@app.server()` requests go through Modal's HTTP proxy, not the input queue, so there is
-no input limit. The Function becomes a web app:
+The Function becomes a web app. Requests go through Modal's HTTP proxy, not the input
+queue, so there is no input limit:
 
 ```python
+# app.py
+api = FastAPI()
+
+@api.post("/work")
+async def work(body: dict) -> dict: ...
+
 @app.server(port=8000, cpu=1, target_concurrency=1000)
 class WorkerServer:
     @modal.enter()
@@ -78,14 +111,21 @@ class WorkerServer:
 ```
 
 ```python
-async with session.post("/work", json={"seconds": x}) as r:  # aiohttp
-    result = (await r.json())["seconds"]
+# caller.py
+url = modal.Server.from_name("demo-server", "WorkerServer").get_url()
+
+async with aiohttp.ClientSession(base_url=url) as session:
+    async def call(x):
+        async with session.post("/work", json={"seconds": x}) as r:
+            return (await r.json())["seconds"]
+
+    results = await asyncio.gather(*(call(x) for x in xs))
 ```
 
 The client handles serialization, retries (503 when no container is ready) and timeouts.
 Use aiohttp for high concurrency. With httpx, one process with 1,000 requests in flight
-got about a third of the throughput.
-Production callers also send a [Proxy Token](https://modal.com/docs/guide/webhook-proxy-auth).
+got about a third of the throughput. Production callers also send a
+[Proxy Token](https://modal.com/docs/guide/webhook-proxy-auth).
 
 ## Which one
 
