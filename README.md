@@ -7,6 +7,15 @@ Past that, callers see `Input rate limit exceeded` or `reached pending input que
 Each folder shows one way past the limits: an `app.py` to deploy and a `caller.py` that
 makes 1,000 concurrent calls. The work is a 1-10 s sleep.
 
+Three terms used below:
+
+- **Input:** one call to a Function. A batched call that carries a list is one input.
+- **Accepted vs started:** Modal first accepts an input into its queue, then starts it
+  on a container. The two can have different limits. Both are per Function.
+- **Calls per container:** one container runs several calls at once
+  (`@modal.concurrent(max_inputs=N)`). Modal adds containers as calls pile up, up to
+  `max_containers`.
+
 ## 1. `spawn` instead of `remote`: [`spawn/`](spawn/)
 
 Async calls are accepted at up to 1,500 inputs/s, with a queue of 1 million. The
@@ -21,10 +30,10 @@ call = await worker.work.spawn.aio(x)
 result = await call.get.aio()
 ```
 
-Acceptance is not throughput. Above about 200 inputs/s per Function, spawned inputs
-still get accepted, but they wait longer to start (see [Measured](#measured)). Spawned
-calls also keep running if the caller exits. Call `call.cancel()` for results you no
-longer need.
+Spawned inputs are accepted at up to 1,500/s, but they start more slowly: above about
+200/s per Function, extra inputs wait instead of failing (see [Measured](#measured)).
+Spawned calls also keep running if the caller exits. Call `call.cancel()` for results you
+no longer need.
 
 ## 2. One app copy per caller: [`copies/`](copies/)
 
@@ -80,12 +89,14 @@ Production callers also send a [Proxy Token](https://modal.com/docs/guide/webhoo
 
 ## Which one
 
-| | Function changes | Caller changes | Limit |
-|---|---|---|---|
-| `spawn` | No | One line | 1,500/s accepted, starts slow down above about 200/s |
-| App copies | No | Look up copy N | 200/s × N copies |
-| Batching | Takes a list | Send chunks | 200/s × chunk size |
-| Server | Becomes a web app | HTTP client | No input limit |
+| | Function changes | Caller changes | Accepted | Started | Calls per container here |
+|---|---|---|---|---|---|
+| `spawn` | No | One line | 1,500/s | Lower, extra inputs wait (589/s in the test below) | 500 |
+| App copies | No | Look up copy N | 200/s per copy | Same as accepted | 500 |
+| Batching | Takes a list | Send chunks | 200 inputs/s × chunk size | Same as accepted | 50 chunks of 32 |
+| Server | Becomes a web app | HTTP client | No input limit, 503 when no container is ready | Containers × requests per container | About 1,000 (`target_concurrency`) |
+
+Workspaces can have different rate limits from these defaults.
 
 Start with `spawn`: it is a one-line change. If its start delay matters, deploy app
 copies. Batching fits when the caller already has a list. A Server fits when latency
@@ -97,12 +108,12 @@ matters and the client can own retries. In every case, throughput is also capped
 8 clients × 1,000 calls of 1-10 s, all starting at once, for 60 s, called from a Modal
 container in us-east ([`loadtest/run_in_modal.py`](loadtest/run_in_modal.py)):
 
-| | Calls/s | Ideal | First 8,000 calls back after | Added latency p50 / p90 / p99 | Errors |
-|---|---|---|---|---|---|
-| `spawn` | 589 | 1,455 | 34.6 s | 9.11 / 13.6 / 19.8 s | 0 |
-| App copies (8) | 1,391 | 1,455 | 18.2 s | 0.20 / 1.48 / 5.65 s | 0 |
-| Batching (chunks of 32, one round of 1,000 at a time) | 800 | about 800 | 16.7 s | 0.21 / 2.52 / 5.12 s | 0 |
-| Server | 1,401 | 1,455 | 15.6 s | 0.12 / 0.34 / 5.43 s | 0 |
+| | Calls/s | Ideal | First 8,000 calls back after | Added latency p50 / p90 / p99 | Containers | Errors |
+|---|---|---|---|---|---|---|
+| `spawn` | 589 | 1,455 | 34.6 s | 9.11 / 13.6 / 19.8 s | 12 | 0 |
+| App copies (8) | 1,391 | 1,455 | 18.2 s | 0.20 / 1.48 / 5.65 s | 19 | 0 |
+| Batching (chunks of 32, one round of 1,000 at a time) | 800 | about 800 | 16.7 s | 0.21 / 2.52 / 5.12 s | 6 | 0 |
+| Server | 1,401 | 1,455 | 15.6 s | 0.12 / 0.34 / 5.43 s | 8 | 0 |
 
 Ideal is the rate with no overhead: calls in flight ÷ mean call duration. With no
 overhead, the first calls are all back after about 10 s. Each client waits for its calls,
