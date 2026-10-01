@@ -94,21 +94,23 @@ matters and the client can own retries. In every case, throughput is also capped
 
 ## Measured
 
-8 clients × 1,000 calls of 1-10 s, all starting at once, for 60-120 s:
+8 clients × 1,000 calls of 1-10 s, all starting at once, for 60 s, called from a Modal
+container in us-east ([`loadtest/run_in_modal.py`](loadtest/run_in_modal.py)):
 
-| | Load from | Calls/s | Ideal | Added latency p50 / p90 / p99 | Errors |
+| | Calls/s | Ideal | First 8,000 calls back after | Added latency p50 / p90 / p99 | Errors |
 |---|---|---|---|---|---|
-| `spawn` | Laptop | 755 | 1,455 | 0.67 / 21.7 / 28.1 s | 0 |
-| App copies (8) | Laptop | 1,338 | 1,455 | 0.27 / 2.56 / 6.86 s | 0 |
-| Batching (chunks of 32, one round of 1,000 at a time) | Laptop | 800 | about 800 | 0.26 / 3.58 / 4.17 s | 0 |
-| Server | Modal container (k6) | 1,450 | 1,455 | 0.09 / 0.23 / 1.59 s | 0 |
+| `spawn` | 589 | 1,455 | 34.6 s | 9.11 / 13.6 / 19.8 s | 0 |
+| App copies (8) | 1,391 | 1,455 | 18.2 s | 0.20 / 1.48 / 5.65 s | 0 |
+| Batching (chunks of 32, one round of 1,000 at a time) | 800 | about 800 | 16.7 s | 0.21 / 2.52 / 5.12 s | 0 |
+| Server | 1,401 | 1,455 | 15.6 s | 0.12 / 0.34 / 5.43 s | 0 |
 
-Ideal is the rate with no overhead: calls in flight ÷ mean call duration. Each client
-waits for its calls, so `spawn`'s start delay also lowers its calls/s. Batching's ideal is
-lower because each round waits for its slowest call.
+Ideal is the rate with no overhead: calls in flight ÷ mean call duration. With no
+overhead, the first calls are all back after about 10 s. Each client waits for its calls,
+so `spawn`'s start delay also lowers its calls/s. Batching's ideal is lower because each
+round waits for its slowest call.
 
-Opening 8,000 HTTP connections at once from one laptop failed with connect timeouts. The
-same burst from a Modal container had no errors, so test a Server burst from the cloud.
+Load a Server from the cloud: opening 8,000 HTTP connections at once from one laptop
+failed with connect timeouts.
 
 ## Run
 
@@ -121,8 +123,9 @@ python spawn/caller.py        # prints "1000 calls in N s"
 [`loadtest/`](loadtest/) runs sustained load:
 
 ```bash
-python loadtest/run.py spawn --clients 8 --concurrency 1000 --warmup 0   # also copies, batching, server
-modal run loadtest/k6_in_modal.py --vus 8000                             # Server burst, from a Modal container
+modal run loadtest/run_in_modal.py                                       # all four, from a Modal container
+python loadtest/run.py spawn --clients 8 --concurrency 1000 --warmup 0   # one approach, from this machine
+modal run loadtest/k6_in_modal.py --vus 8000                             # Server burst with k6, from Modal
 ```
 
 Stop the apps when done. They keep a warm container:
