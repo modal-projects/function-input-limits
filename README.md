@@ -94,17 +94,21 @@ matters and the client can own retries. In every case, throughput is also capped
 
 ## Measured
 
-`loadtest/run.py` with 8 clients × 1,000 concurrent 1-10 s calls, 100 s measured:
+8 clients × 1,000 calls of 1-10 s, all starting at once, for 60-120 s:
 
-| | Calls/s | Ideal | Added latency p50 / p90 | Errors |
-|---|---|---|---|---|
-| `spawn` | 673 | 1,455 | 0.26 / 23 s | 0 |
-| App copies (8) | 1,360 | 1,455 | 0.33 / 0.63 s | 0 |
-| Batching (chunks of 32, one round of 1,000 at a time) | 740 | about 800 | 0.60 / 1.11 s | 0 |
-| Server (aiohttp client) | 1,419 | 1,455 | 0.14 / 0.17 s | 0 |
+| | Load from | Calls/s | Ideal | Added latency p50 / p90 / p99 | Errors |
+|---|---|---|---|---|---|
+| `spawn` | Laptop | 755 | 1,455 | 0.67 / 21.7 / 28.1 s | 0 |
+| App copies (8) | Laptop | 1,338 | 1,455 | 0.27 / 2.56 / 6.86 s | 0 |
+| Batching (chunks of 32, one round of 1,000 at a time) | Laptop | 800 | about 800 | 0.26 / 3.58 / 4.17 s | 0 |
+| Server | Modal container (k6) | 1,450 | 1,455 | 0.09 / 0.23 / 1.59 s | 0 |
 
-Each client waits for its calls, so `spawn`'s start delay also lowers its calls/s.
-Batching's ideal is lower because each round waits for its slowest call.
+Ideal is the rate with no overhead: calls in flight ÷ mean call duration. Each client
+waits for its calls, so `spawn`'s start delay also lowers its calls/s. Batching's ideal is
+lower because each round waits for its slowest call.
+
+Opening 8,000 HTTP connections at once from one laptop failed with connect timeouts. The
+same burst from a Modal container had no errors, so test a Server burst from the cloud.
 
 ## Run
 
@@ -114,7 +118,12 @@ modal deploy spawn/app.py
 python spawn/caller.py        # prints "1000 calls in N s"
 ```
 
-[`loadtest/`](loadtest/) runs sustained load: `python loadtest/run.py spawn --clients 8 --concurrency 1000`.
+[`loadtest/`](loadtest/) runs sustained load:
+
+```bash
+python loadtest/run.py spawn --clients 8 --concurrency 1000 --warmup 0   # also copies, batching, server
+modal run loadtest/k6_in_modal.py --vus 8000                             # Server burst, from a Modal container
+```
 
 Stop the apps when done. They keep a warm container:
 

@@ -24,8 +24,10 @@ import time
 async def _client(make_call, idx, args, out):
     call = await make_call(idx)
     overheads, errors, done = [], collections.Counter(), 0
-    stop_at = time.monotonic() + args.duration
-    warm_until = time.monotonic() + args.warmup
+    t_start = time.monotonic()
+    stop_at = t_start + args.duration
+    warm_until = t_start + args.warmup
+    first_done = []  # seconds from start until each call loop's (or the first round's) first success
 
     async def rounds():
         nonlocal done
@@ -34,6 +36,8 @@ async def _client(make_call, idx, args, out):
             t0 = time.monotonic()
             try:
                 await call(round_)
+                if not first_done:
+                    first_done.append(time.monotonic() - t_start)
                 if t0 > warm_until:
                     done += len(round_)
                     overheads.append(time.monotonic() - t0 - max(round_))
@@ -43,12 +47,16 @@ async def _client(make_call, idx, args, out):
 
     async def loop():
         nonlocal done
-        await asyncio.sleep(random.uniform(0, 10))  # stagger starts
+        await asyncio.sleep(random.uniform(0, args.ramp))  # 0: every call starts at once
+        first = True
         while time.monotonic() < stop_at:
             s = random.uniform(1, 10)
             t0 = time.monotonic()
             try:
                 await call(s)
+                if first:
+                    first_done.append(time.monotonic() - t_start)
+                    first = False
                 if t0 > warm_until:
                     done += 1
                     overheads.append(time.monotonic() - t0 - s)
@@ -62,7 +70,7 @@ async def _client(make_call, idx, args, out):
         await asyncio.gather(*(loop() for _ in range(args.concurrency)))
     if close := getattr(call, "close", None):
         await close()
-    out.put((done, overheads, dict(errors)))
+    out.put((done, overheads, dict(errors), first_done))
 
 
 def _proc(make_call, idx, args, out):
@@ -83,6 +91,7 @@ def run(make_call, name: str, lockstep: bool = False):
     ap.add_argument("--concurrency", type=int, default=1000)
     ap.add_argument("--duration", type=float, default=120)
     ap.add_argument("--warmup", type=float, default=20)
+    ap.add_argument("--ramp", type=float, default=0, help="spread call-loop starts over this many seconds")
     args = ap.parse_args()
     args.lockstep = lockstep
 
@@ -103,6 +112,10 @@ def run(make_call, name: str, lockstep: bool = False):
     shape = "lockstep" if lockstep else "independent"
     print(f"{name} ({shape}): clients={args.clients} concurrency={args.concurrency} measured={measured:.0f}s")
     print(f"completed calls: {total} ({total / measured:.0f}/s)")
+    firsts = [f for r in results for f in r[3]]
+    expected = args.clients * (1 if lockstep else args.concurrency)
+    if firsts:
+        print(f"first calls returned: {len(firsts)}/{expected}, last one after {max(firsts):.1f}s")
     if overheads:
         print(
             f"overhead s: p50={_pct(overheads, 50):.2f} p90={_pct(overheads, 90):.2f} "
